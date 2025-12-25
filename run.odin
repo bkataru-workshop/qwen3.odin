@@ -70,25 +70,33 @@ Transformer :: struct {
 	file_size: int, // size of the checkpoint file in bytes
 }
 
-malloc_run_state :: proc(config: Config) -> (state: Run_State, err: mem.Allocator_Error) {
+malloc_run_state :: proc(config: Config) -> (state: Run_State) {
 	att_head_dim := config.n_heads * config.head_dim
 	kv_dim := config.n_kv_heads * config.head_dim // 1024
 
-	state.x = make([]f32, config.dim) or_return
-	state.xb = make([]f32, config.dim) or_return
-	state.xb2 = make([]f32, config.dim) or_return
-	state.xb3 = make([]f32, att_head_dim) or_return
-	state.hb = make([]f32, config.hidden_dim) or_return
-	state.hb2 = make([]f32, config.hidden_dim) or_return
-	state.q = make([]f32, att_head_dim) or_return
-	state.k = make([]f32, kv_dim) or_return
-	state.v = make([]f32, kv_dim) or_return
-	state.att = make([]f32, config.n_heads * config.seq_len) or_return
-	state.logits = make([]f32, config.n_layers * config.seq_len * kv_dim) or_return
-	state.key_cache = make([]f32, config.n_layers * config.seq_len * kv_dim) or_return
-	state.value_cache = make([]f32, config.n_layers * config.seq_len * kv_dim) or_return
+	err: mem.Allocator_Error
 
-	return state, nil
+	state.x, err = make([]f32, config.dim)
+	state.xb, err = make([]f32, config.dim)
+	state.xb2, err = make([]f32, config.dim)
+	state.xb3, err = make([]f32, att_head_dim)
+	state.hb, err = make([]f32, config.hidden_dim)
+	state.hb2, err = make([]f32, config.hidden_dim)
+	state.q, err = make([]f32, att_head_dim)
+	state.k, err = make([]f32, kv_dim)
+	state.v, err = make([]f32, kv_dim)
+	state.att, err = make([]f32, config.n_heads * config.seq_len)
+	state.logits, err = make([]f32, config.n_layers * config.seq_len * kv_dim)
+	state.key_cache, err = make([]f32, config.n_layers * config.seq_len * kv_dim)
+	state.value_cache, err = make([]f32, config.n_layers * config.seq_len * kv_dim)
+
+	// ensure all mallocs went fine
+	if err != .None {
+		fmt.eprintf("malloc failed: %v\n", err)
+		os.exit(1)
+	}
+
+	return state
 }
 
 free_run_state :: proc(state: ^Run_State) {
@@ -138,33 +146,73 @@ bytes_as_floats :: proc(data: []u8) -> ([]f32, Byte_Slice_Error) {
 
 
 // Map GGUF layers to transformer weights
-memory_map_weights :: proc(data: []u8, config: Config, header_offset: uint) -> TransformerWeights {
+memory_map_weights :: proc(
+	data: []u8,
+	config: Config,
+	header_offset: uint,
+) -> (
+	weights: Transformer_Weights,
+) {
 	float_data, err := bytes_as_floats(data[header_offset:])
-	if err != .None {
-		switch err {
-		case .Length_Not_Multiple_Of_4:
-			fmt.eprintln("Byte slice length is not a multiple of 4")
-			return
-		case .Data_Not_4_Byte_Aligned:
-			fmt.eprintln("Data is not 4-byte aligned")
-			return
-		case:
-			unreachable()
-		}
+	switch err {
+	case .Length_Not_Multiple_Of_4:
+		fmt.eprintln("Byte slice length is not a multiple of 4")
+		os.exit(1)
+	case .Data_Not_4_Byte_Aligned:
+		fmt.eprintln("Data is not 4-byte aligned")
+		os.exit(1)
+	case .None:
 	}
 	offset := 0
 
-	wcls := float_data[offset:offset + config.vocab_size * config.dim] // last layer in TR
+	weights.wcls = float_data[offset:offset + config.vocab_size * config.dim] // last layer in TR
 	offset += config.vocab_size * config.dim
-	rms_final_weight := float_data[offset:offset + config.dim] // right before the last
+	weights.rms_final_weight = float_data[offset:offset + config.dim] // right before the last
 	offset += config.dim
-	token_embedding_table := float_data[offset:offset + config.vocab_size * config.dim] // first layer
+	weights.token_embedding_table = float_data[offset:offset + config.vocab_size * config.dim] // first layer
 	offset += config.vocab_size * config.dim
-	wk := float_data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
+	weights.wk = float_data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
 	offset += config.dim * (config.n_kv_heads * config.head_dim) // 1024 x 1024 = dim (1024) x num_kv_heads (8) x p->head_dim (128)
-	wk_norm := float_data[offset:offset + config.head_dim]
+	weights.wk_norm = float_data[offset:offset + config.head_dim]
 	offset += config.head_dim // head_dim (128)
-	rms_att_weight := float_data[offset:offset + config.dim]
+	weights.rms_att_weight = float_data[offset:offset + config.dim]
 	offset += config.dim // dimension (1024)
+	weights.wo = float_data[offset:offset + (config.n_heads * config.head_dim) * config.dim]
+	offset += (config.n_heads * config.head_dim) * config.dim // attention heads (16) x head dim (128) * dim
+	weights.wq = float_data[offset:offset + config.dim * (config.n_heads * config.head_dim)]
+	offset += config.dim * (config.n_heads * config.head_dim)
+	weights.wq_norm = float_data[offset:offset + config.head_dim]
+	offset += config.head_dim // head_dim (128)
+	weights.wv = float_data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
+	offset += config.dim * (config.n_kv_heads * config.head_dim) // equal to wk
+	weights.w2 = float_data[offset:offset + config.hidden_dim * config.dim]
+	offset += config.hidden_dim * config.dim // ffn.down 3072 * 1024
+	weights.w3 = float_data[offset:offset + config.dim * config.hidden_dim]
+	offset += config.dim * config.hidden_dim // ffn.gate
+	weights.rms_ffn_weight = float_data[offset:offset + config.dim]
+	offset += config.dim // ffn.norm
+	weights.w1 = float_data[offset:offset + config.dim * config.hidden_dim]
+	offset += config.dim * config.hidden_dim // ffn.up
+
+	return weights
+}
+
+// --------------------------------------
+// read GGUF
+read_checkpoint :: proc(path: string, config: Config) -> Transformer {
+	mmap, err := virtual.map_file_from_path(path, {.Read})
+	if err != .None {
+		fmt.eprintf("mmap failed: %v\n", err)
+		os.exit(1)
+	}
+	header_offset := 5951648
+
+	fmt.printf("file size is %d\n", len(mmap))
+
+	weights := memory_map_weights(mmap, config, header_offset)
+	state, err := malloc_run_state(config)
+	if err != .None {
+		fmt.println("malloc failed")
+	}
 
 }
