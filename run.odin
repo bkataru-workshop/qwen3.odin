@@ -70,7 +70,7 @@ Transformer :: struct {
 	file_size: int, // size of the checkpoint file in bytes
 }
 
-malloc_run_state :: proc(config: Config) -> (state: Run_State) {
+malloc_run_state :: proc(state: ^Run_State, config: Config) {
 	att_head_dim := config.n_heads * config.head_dim
 	kv_dim := config.n_kv_heads * config.head_dim // 1024
 
@@ -95,8 +95,6 @@ malloc_run_state :: proc(config: Config) -> (state: Run_State) {
 		fmt.eprintf("malloc failed: %v\n", err)
 		os.exit(1)
 	}
-
-	return state
 }
 
 free_run_state :: proc(state: ^Run_State) {
@@ -115,22 +113,18 @@ free_run_state :: proc(state: ^Run_State) {
 	delete(state.value_cache)
 }
 
-Byte_Slice_Error :: enum {
-	None,
-	Length_Not_Multiple_Of_4,
-	Data_Not_4_Byte_Aligned,
-}
-
-bytes_as_floats :: proc(data: []u8) -> ([]f32, Byte_Slice_Error) {
+bytes_as_floats :: proc(data: []u8) -> []f32 {
 	// 1. Check if the length is a multiple of size_of(f32)
 	if len(data) % size_of(f32) != 0 {
-		return nil, .Length_Not_Multiple_Of_4
+		fmt.eprintln("Byte slice length is not a multiple of 4")
+		os.exit(1)
 	}
 
 	// 2. Check if the data pointer is 4-byte aligned
 	// uintptr is used for pointer arithmetic/alignment checks
 	if uintptr(raw_data(data)) % align_of(f32) != 0 {
-		return nil, .Data_Not_4_Byte_Aligned
+		fmt.eprintln("Data is not 4-byte aligned")
+		os.exit(1)
 	}
 
 	// 3. Perform the cast
@@ -141,7 +135,7 @@ bytes_as_floats :: proc(data: []u8) -> ([]f32, Byte_Slice_Error) {
 	// mem.slice_ptr converts a raw pointer and length into a slice
 	// new_slice := mem.slice_ptr(ptr, len(data) / 4)
 
-	return new_slice, .None
+	return new_slice
 }
 
 
@@ -153,16 +147,7 @@ memory_map_weights :: proc(
 ) -> (
 	weights: Transformer_Weights,
 ) {
-	float_data, err := bytes_as_floats(data[header_offset:])
-	switch err {
-	case .Length_Not_Multiple_Of_4:
-		fmt.eprintln("Byte slice length is not a multiple of 4")
-		os.exit(1)
-	case .Data_Not_4_Byte_Aligned:
-		fmt.eprintln("Data is not 4-byte aligned")
-		os.exit(1)
-	case .None:
-	}
+	float_data := bytes_as_floats(data[header_offset:])
 	offset := 0
 
 	weights.wcls = float_data[offset:offset + config.vocab_size * config.dim] // last layer in TR
@@ -199,20 +184,28 @@ memory_map_weights :: proc(
 
 // --------------------------------------
 // read GGUF
-read_checkpoint :: proc(path: string, config: Config) -> Transformer {
-	mmap, err := virtual.map_file_from_path(path, {.Read})
+read_checkpoint :: proc(
+	checkpoint: string,
+	config: Config,
+	weights: Transformer_Weights,
+	data: ^[]f32,
+	file_size: int,
+) -> (
+	transformer: Transformer,
+) {
+	mmap, err := virtual.map_file_from_path(checkpoint, {.Read})
 	if err != .None {
 		fmt.eprintf("mmap failed: %v\n", err)
 		os.exit(1)
 	}
-	header_offset := 5951648
+	header_offset: uint = 5951648
 
 	fmt.printf("file size is %d\n", len(mmap))
+	transformer.file_size = len(mmap)
 
-	weights := memory_map_weights(mmap, config, header_offset)
-	state, err := malloc_run_state(config)
-	if err != .None {
-		fmt.println("malloc failed")
-	}
+	transformer.weights = memory_map_weights(mmap, config, header_offset)
+	transformer.state = malloc_run_state(config)
 
+	transformer.config = config
+	transformer.data = mmap[:]
 }
