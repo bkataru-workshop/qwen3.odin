@@ -144,34 +144,34 @@ bytes_as_floats :: proc(data: []u8) -> []f32 {
 memory_map_weights :: proc(w: ^Transformer_Weights, p: Config, data: []f32) {
 	offset := 0
 
-	weights.wcls = data[offset:offset + config.vocab_size * config.dim] // last layer in TR
-	offset += config.vocab_size * config.dim
-	weights.rms_final_weight = data[offset:offset + config.dim] // right before the last
-	offset += config.dim
-	weights.token_embedding_table = data[offset:offset + config.vocab_size * config.dim] // first layer
-	offset += config.vocab_size * config.dim
-	weights.wk = data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
-	offset += config.dim * (config.n_kv_heads * config.head_dim) // 1024 x 1024 = dim (1024) x num_kv_heads (8) x p->head_dim (128)
-	weights.wk_norm = data[offset:offset + config.head_dim]
-	offset += config.head_dim // head_dim (128)
-	weights.rms_att_weight = data[offset:offset + config.dim]
-	offset += config.dim // dimension (1024)
-	weights.wo = data[offset:offset + (config.n_heads * config.head_dim) * config.dim]
-	offset += (config.n_heads * config.head_dim) * config.dim // attention heads (16) x head dim (128) * dim
-	weights.wq = data[offset:offset + config.dim * (config.n_heads * config.head_dim)]
-	offset += config.dim * (config.n_heads * config.head_dim)
-	weights.wq_norm = data[offset:offset + config.head_dim]
-	offset += config.head_dim // head_dim (128)
-	weights.wv = float_data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
-	offset += config.dim * (config.n_kv_heads * config.head_dim) // equal to wk
-	weights.w2 = float_data[offset:offset + config.hidden_dim * config.dim]
-	offset += config.hidden_dim * config.dim // ffn.down 3072 * 1024
-	weights.w3 = float_data[offset:offset + config.dim * config.hidden_dim]
-	offset += config.dim * config.hidden_dim // ffn.gate
-	weights.rms_ffn_weight = float_data[offset:offset + config.dim]
-	offset += config.dim // ffn.norm
-	weights.w1 = float_data[offset:offset + config.dim * config.hidden_dim]
-	offset += config.dim * config.hidden_dim // ffn.up
+	w.wcls = data[offset:offset + p.vocab_size * p.dim] // last layer in TR
+	offset += p.vocab_size * p.dim
+	w.rms_final_weight = data[offset:offset + p.dim] // right before the last
+	offset += p.dim
+	w.token_embedding_table = data[offset:offset + p.vocab_size * p.dim] // first layer
+	offset += p.vocab_size * p.dim
+	w.wk = data[offset:offset + p.dim * (p.n_kv_heads * p.head_dim)]
+	offset += p.dim * (p.n_kv_heads * p.head_dim) // 1024 x 1024 = dim (1024) x num_kv_heads (8) x p->head_dim (128)
+	w.wk_norm = data[offset:offset + p.head_dim]
+	offset += p.head_dim // head_dim (128)
+	w.rms_att_weight = data[offset:offset + p.dim]
+	offset += p.dim // dimension (1024)
+	w.wo = data[offset:offset + (p.n_heads * p.head_dim) * p.dim]
+	offset += (p.n_heads * p.head_dim) * p.dim // attention heads (16) x head dim (128) * dim
+	w.wq = data[offset:offset + p.dim * (p.n_heads * p.head_dim)]
+	offset += p.dim * (p.n_heads * p.head_dim)
+	w.wq_norm = data[offset:offset + p.head_dim]
+	offset += p.head_dim // head_dim (128)
+	w.wv = data[offset:offset + p.dim * (p.n_kv_heads * p.head_dim)]
+	offset += p.dim * (p.n_kv_heads * p.head_dim) // equal to wk
+	w.w2 = data[offset:offset + p.hidden_dim * p.dim]
+	offset += p.hidden_dim * p.dim // ffn.down 3072 * 1024
+	w.w3 = data[offset:offset + p.dim * p.hidden_dim]
+	offset += p.dim * p.hidden_dim // ffn.gate
+	w.rms_ffn_weight = data[offset:offset + p.dim]
+	offset += p.dim // ffn.norm
+	w.w1 = data[offset:offset + p.dim * p.hidden_dim]
+	offset += p.dim * p.hidden_dim // ffn.up
 }
 
 // --------------------------------------
@@ -182,8 +182,6 @@ read_checkpoint :: proc(
 	weights: ^Transformer_Weights,
 	data: ^[]f32,
 	file_size: ^int,
-) -> (
-	transformer: Transformer,
 ) {
 	mmap, err := virtual.map_file_from_path(checkpoint_path, {.Read})
 	if err != .None {
@@ -193,17 +191,24 @@ read_checkpoint :: proc(
 	header_offset: uint = 5951648
 
 	fmt.printf("file size is %d\n", len(mmap))
-	transformer.file_size = len(mmap)
+	file_size^ = len(mmap)
 
-	transformer.data = bytes_as_floats(mmap[header_offset:])
+	data^ = bytes_as_floats(mmap[header_offset:]) // skip header bytes. header_size = 5951648 TODO
+	// gguf total header = file size - (last tensor size + last offset)
 
-	memory_map_weights(&transformer.weights, config, transformer.data)
-	malloc_run_state(&transformer.state, config)
-
-	transformer.config = config
+	memory_map_weights(weights, config, data^)
 }
 
 build_transformer :: proc(t: ^Transformer, checkpoint_path: string) {
 	// read in the Weights from the GGUF
-	read_checkpoint(checkpoint_path, t.config)
+	read_checkpoint(checkpoint_path, t.config, &t.weights, &t.data, &t.file_size)
+	// allocate the Run_State buffers
+	malloc_run_state(&t.state, t.config)
+}
+
+free_transformer :: proc(t: ^Transformer) {
+	if t.data != nil {
+		virtual.release(raw_data(t.data), len(t.data))
+		t.data = nil
+	}
 }
