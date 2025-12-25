@@ -1,11 +1,11 @@
+/* Inference for GGUF Qwen-3 models in pure Odin */
+
 package qwen3
 
 import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:os"
-
-/* Inference for GGUF Qwen-3 models in pure Odin */
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -65,30 +65,31 @@ Transformer :: struct {
 	config:    Config, // the hyperparameters of the architecture (the blueprint)
 	weights:   Transformer_Weights, // the weights of the model
 	state:     Run_State, // buffers for the "wave" of activations in the forward pass
-	fd:        int, // file descriptor for memory mapping
+	// TODO: remove the fd field? do we need this?
+	// fd:        int, // file descriptor for memory mapping
 	data:      []f32, // memory mapped data pointer
 	file_size: int, // size of the checkpoint file in bytes
 }
 
-malloc_run_state :: proc(state: ^Run_State, config: Config) {
-	att_head_dim := config.n_heads * config.head_dim
-	kv_dim := config.n_kv_heads * config.head_dim // 1024
+malloc_run_state :: proc(s: ^Run_State, p: Config) {
+	att_head_dim := p.n_heads * p.head_dim
+	kv_dim := p.n_kv_heads * p.head_dim // 1024
 
 	err: mem.Allocator_Error
 
-	state.x, err = make([]f32, config.dim)
-	state.xb, err = make([]f32, config.dim)
-	state.xb2, err = make([]f32, config.dim)
-	state.xb3, err = make([]f32, att_head_dim)
-	state.hb, err = make([]f32, config.hidden_dim)
-	state.hb2, err = make([]f32, config.hidden_dim)
-	state.q, err = make([]f32, att_head_dim)
-	state.k, err = make([]f32, kv_dim)
-	state.v, err = make([]f32, kv_dim)
-	state.att, err = make([]f32, config.n_heads * config.seq_len)
-	state.logits, err = make([]f32, config.n_layers * config.seq_len * kv_dim)
-	state.key_cache, err = make([]f32, config.n_layers * config.seq_len * kv_dim)
-	state.value_cache, err = make([]f32, config.n_layers * config.seq_len * kv_dim)
+	s.x, err = make([]f32, p.dim)
+	s.xb, err = make([]f32, p.dim)
+	s.xb2, err = make([]f32, p.dim)
+	s.xb3, err = make([]f32, att_head_dim)
+	s.hb, err = make([]f32, p.hidden_dim)
+	s.hb2, err = make([]f32, p.hidden_dim)
+	s.q, err = make([]f32, att_head_dim)
+	s.k, err = make([]f32, kv_dim)
+	s.v, err = make([]f32, kv_dim)
+	s.att, err = make([]f32, p.n_heads * p.seq_len)
+	s.logits, err = make([]f32, p.vocab_size)
+	s.key_cache, err = make([]f32, p.n_layers * p.seq_len * kv_dim)
+	s.value_cache, err = make([]f32, p.n_layers * p.seq_len * kv_dim)
 
 	// ensure all mallocs went fine
 	if err != .None {
@@ -97,20 +98,20 @@ malloc_run_state :: proc(state: ^Run_State, config: Config) {
 	}
 }
 
-free_run_state :: proc(state: ^Run_State) {
-	delete(state.x)
-	delete(state.xb)
-	delete(state.xb2)
-	delete(state.xb3)
-	delete(state.hb)
-	delete(state.hb2)
-	delete(state.q)
-	delete(state.k)
-	delete(state.v)
-	delete(state.att)
-	delete(state.logits)
-	delete(state.key_cache)
-	delete(state.value_cache)
+free_run_state :: proc(s: ^Run_State) {
+	delete(s.x)
+	delete(s.xb)
+	delete(s.xb2)
+	delete(s.xb3)
+	delete(s.hb)
+	delete(s.hb2)
+	delete(s.q)
+	delete(s.k)
+	delete(s.v)
+	delete(s.att)
+	delete(s.logits)
+	delete(s.key_cache)
+	delete(s.value_cache)
 }
 
 bytes_as_floats :: proc(data: []u8) -> []f32 {
@@ -140,33 +141,26 @@ bytes_as_floats :: proc(data: []u8) -> []f32 {
 
 
 // Map GGUF layers to transformer weights
-memory_map_weights :: proc(
-	data: []u8,
-	config: Config,
-	header_offset: uint,
-) -> (
-	weights: Transformer_Weights,
-) {
-	float_data := bytes_as_floats(data[header_offset:])
+memory_map_weights :: proc(w: ^Transformer_Weights, p: Config, data: []f32) {
 	offset := 0
 
-	weights.wcls = float_data[offset:offset + config.vocab_size * config.dim] // last layer in TR
+	weights.wcls = data[offset:offset + config.vocab_size * config.dim] // last layer in TR
 	offset += config.vocab_size * config.dim
-	weights.rms_final_weight = float_data[offset:offset + config.dim] // right before the last
+	weights.rms_final_weight = data[offset:offset + config.dim] // right before the last
 	offset += config.dim
-	weights.token_embedding_table = float_data[offset:offset + config.vocab_size * config.dim] // first layer
+	weights.token_embedding_table = data[offset:offset + config.vocab_size * config.dim] // first layer
 	offset += config.vocab_size * config.dim
-	weights.wk = float_data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
+	weights.wk = data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
 	offset += config.dim * (config.n_kv_heads * config.head_dim) // 1024 x 1024 = dim (1024) x num_kv_heads (8) x p->head_dim (128)
-	weights.wk_norm = float_data[offset:offset + config.head_dim]
+	weights.wk_norm = data[offset:offset + config.head_dim]
 	offset += config.head_dim // head_dim (128)
-	weights.rms_att_weight = float_data[offset:offset + config.dim]
+	weights.rms_att_weight = data[offset:offset + config.dim]
 	offset += config.dim // dimension (1024)
-	weights.wo = float_data[offset:offset + (config.n_heads * config.head_dim) * config.dim]
+	weights.wo = data[offset:offset + (config.n_heads * config.head_dim) * config.dim]
 	offset += (config.n_heads * config.head_dim) * config.dim // attention heads (16) x head dim (128) * dim
-	weights.wq = float_data[offset:offset + config.dim * (config.n_heads * config.head_dim)]
+	weights.wq = data[offset:offset + config.dim * (config.n_heads * config.head_dim)]
 	offset += config.dim * (config.n_heads * config.head_dim)
-	weights.wq_norm = float_data[offset:offset + config.head_dim]
+	weights.wq_norm = data[offset:offset + config.head_dim]
 	offset += config.head_dim // head_dim (128)
 	weights.wv = float_data[offset:offset + config.dim * (config.n_kv_heads * config.head_dim)]
 	offset += config.dim * (config.n_kv_heads * config.head_dim) // equal to wk
@@ -178,22 +172,20 @@ memory_map_weights :: proc(
 	offset += config.dim // ffn.norm
 	weights.w1 = float_data[offset:offset + config.dim * config.hidden_dim]
 	offset += config.dim * config.hidden_dim // ffn.up
-
-	return weights
 }
 
 // --------------------------------------
 // read GGUF
 read_checkpoint :: proc(
-	checkpoint: string,
+	checkpoint_path: string,
 	config: Config,
-	weights: Transformer_Weights,
+	weights: ^Transformer_Weights,
 	data: ^[]f32,
-	file_size: int,
+	file_size: ^int,
 ) -> (
 	transformer: Transformer,
 ) {
-	mmap, err := virtual.map_file_from_path(checkpoint, {.Read})
+	mmap, err := virtual.map_file_from_path(checkpoint_path, {.Read})
 	if err != .None {
 		fmt.eprintf("mmap failed: %v\n", err)
 		os.exit(1)
@@ -203,9 +195,15 @@ read_checkpoint :: proc(
 	fmt.printf("file size is %d\n", len(mmap))
 	transformer.file_size = len(mmap)
 
-	transformer.weights = memory_map_weights(mmap, config, header_offset)
-	transformer.state = malloc_run_state(config)
+	transformer.data = bytes_as_floats(mmap[header_offset:])
+
+	memory_map_weights(&transformer.weights, config, transformer.data)
+	malloc_run_state(&transformer.state, config)
 
 	transformer.config = config
-	transformer.data = mmap[:]
+}
+
+build_transformer :: proc(t: ^Transformer, checkpoint_path: string) {
+	// read in the Weights from the GGUF
+	read_checkpoint(checkpoint_path, t.config)
 }
