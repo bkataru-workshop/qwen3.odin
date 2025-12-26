@@ -6,18 +6,21 @@ import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
 import "core:os"
+import "core:strconv"
+import "core:strings"
+import "core:testing"
 
 // ----------------------------------------------------------------------------
 // Transformer model
 Config :: struct {
-	dim:        int, // transformer dimension
-	hidden_dim: int, // for ffn layers
-	n_layers:   int, // number of layers
-	n_heads:    int, // number of query heads
-	n_kv_heads: int, // numbery of key/value heads (can be < query heads because of multiquery)
-	vocab_size: int, // vocabulary size
-	seq_len:    int, // max sequence length
-	head_dim:   int, // attention dimension
+	dim:        uint, // transformer dimension
+	hidden_dim: uint, // for ffn layers
+	n_layers:   uint, // number of layers
+	n_heads:    uint, // number of query heads
+	n_kv_heads: uint, // numbery of key/value heads (can be < query heads because of multiquery)
+	vocab_size: uint, // vocabulary size
+	seq_len:    uint, // max sequence length
+	head_dim:   uint, // attention dimension
 }
 
 Transformer_Weights :: struct {
@@ -142,7 +145,7 @@ bytes_as_floats :: proc(data: []u8) -> []f32 {
 
 // Map GGUF layers to transformer weights
 memory_map_weights :: proc(w: ^Transformer_Weights, p: Config, data: []f32) {
-	offset := 0
+	offset: uint = 0
 
 	w.wcls = data[offset:offset + p.vocab_size * p.dim] // last layer in TR
 	offset += p.vocab_size * p.dim
@@ -211,4 +214,81 @@ free_transformer :: proc(t: ^Transformer) {
 		virtual.release(raw_data(t.data), len(t.data))
 		t.data = nil
 	}
+}
+
+// load the GGUF config file
+load_config :: proc(t: ^Transformer, filename: string = "header.txt") {
+	data, ok := os.read_entire_file(filename)
+	if !ok {
+		fmt.eprintf("Failed to open %s\n", filename)
+		os.exit(1)
+	}
+	defer delete(data)
+
+	oks: [8]bool
+
+	it := string(data)
+	for line in strings.split_lines_iterator(&it) {
+		cleaned := strings.trim_space(line)
+
+		if strings.index(cleaned, "=") == -1 do continue
+
+		parts := strings.split_n(cleaned, "=", 2)
+		defer delete(parts)
+
+		key, value := parts[0], parts[1]
+
+		if (len(key) == 0 || len(value) == 0) do continue
+
+		switch key {
+		case "QWEN3_EMBEDDING_LENGTH":
+			t.config.dim, oks[0] = strconv.parse_uint(value, 10)
+		case "QWEN3_FEED_FORWARD_LENGTH":
+			t.config.hidden_dim, oks[1] = strconv.parse_uint(value, 10)
+		case "QWEN3_BLOCK_COUNT":
+			t.config.n_layers, oks[2] = strconv.parse_uint(value, 10)
+		case "QWEN3_ATTENTION_HEAD_COUNT":
+			t.config.n_heads, oks[3] = strconv.parse_uint(value, 10)
+		case "QWEN3_ATTENTION_HEAD_COUNT_KV":
+			t.config.n_kv_heads, oks[4] = strconv.parse_uint(value, 10)
+		case "QWEN3_CONTEXT_LENGTH":
+			t.config.seq_len, oks[5] = strconv.parse_uint(value, 10)
+		case "QWEN3_ATTENTION_KEY_LENGTH":
+			t.config.head_dim, oks[6] = strconv.parse_uint(value, 10)
+		case "TOKENIZER_GGML_TOKENS":
+			ARRAY_LENGTH_KEY :: "ARRAY_LENGTH="
+
+			if needle := strings.index(value, ARRAY_LENGTH_KEY); needle != -1 {
+				start := needle + len(ARRAY_LENGTH_KEY)
+				subvalue := value[start:]
+				t.config.vocab_size, oks[7] = strconv.parse_uint(subvalue, 10)
+			} else {
+				fmt.eprintf("No key named '%s' found in config", ARRAY_LENGTH_KEY)
+				os.exit(1)
+			}
+		}
+	}
+
+	for ok in oks {
+		if !ok {
+			fmt.eprintln("Invalid or corrupted config, didn't find exactly eight keys")
+			os.exit(1)
+		}
+	}
+}
+
+@(test)
+config_load :: proc(t: ^testing.T) {
+	tr: Transformer
+
+	load_config(&tr, "header.txt")
+
+	testing.expect_value(t, tr.config.dim, 1024)
+	testing.expect_value(t, tr.config.hidden_dim, 3072)
+	testing.expect_value(t, tr.config.n_layers, 28)
+	testing.expect_value(t, tr.config.n_heads, 16)
+	testing.expect_value(t, tr.config.n_kv_heads, 8)
+	testing.expect_value(t, tr.config.vocab_size, 151936)
+	testing.expect_value(t, tr.config.seq_len, 40960)
+	testing.expect_value(t, tr.config.head_dim, 128)
 }

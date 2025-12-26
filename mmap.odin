@@ -4,7 +4,7 @@ import "core:fmt"
 import "core:mem/virtual"
 import "core:os"
 
-main :: proc() {
+mmap_main :: proc() {
 	filename := "mmap_demo.bin"
 	initial_content := "Odin MMap Test Data"
 
